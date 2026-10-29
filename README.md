@@ -12,7 +12,7 @@ People abroad send money home for school fees, rent and hospital bills, and too 
 | ------------------------------------------- | --------------------------------------------------- |
 | **remitsure-contracts** (this repo)         | Soroban contract that locks, releases and refunds   |
 | [remitsure-backend](../remitsure-backend)   | API, event indexer, payee directory                 |
-| [remitsure-web](../remitsure-web)           | Next.js app with Stellar wallet                     |
+| [remitsure-frontend](../remitsure-frontend) | Next.js app with Stellar wallet                     |
 
 ## Contract API
 
