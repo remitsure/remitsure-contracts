@@ -4,3 +4,8 @@ test_snapshots/
 .stellar/
 .env
 .DS_Store
+
+# Editors and logs
+.vscode/
+.idea/
+*.log
