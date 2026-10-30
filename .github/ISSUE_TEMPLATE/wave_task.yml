@@ -1,0 +1,42 @@
+name: Wave task
+description: A scoped task for Drips Wave contributors
+labels: [wave]
+body:
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Why this matters and where it fits.
+    validations:
+      required: true
+  - type: textarea
+    id: task
+    attributes:
+      label: What to do
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      placeholder: |
+        - [ ] ...
+        - [ ] Tests added or updated
+        - [ ] CI is green
+    validations:
+      required: true
+  - type: dropdown
+    id: complexity
+    attributes:
+      label: Complexity
+      options:
+        - Trivial
+        - Medium
+        - High
+    validations:
+      required: true
+  - type: textarea
+    id: pointers
+    attributes:
+      label: Pointers
+      description: Files, functions or links that help someone get started.
