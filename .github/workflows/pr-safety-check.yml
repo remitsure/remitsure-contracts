@@ -1,0 +1,126 @@
+name: PR safety check
+
+# Flags pull requests that change files able to run code, publish packages or weaken review,
+# so they get a careful read before anyone merges them.
+#
+# pull_request_target runs the copy of this file on the default branch, so a PR cannot edit
+# the check to make itself pass. It must NEVER check out or run code from the PR. It only
+# reads the PR's file list, patches and commits through the GitHub API.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: pr-safety-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-safety:
+    name: PR safety check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          retries: 3
+          script: |
+            const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request;
+            const sha = pr.head.sha;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const setStatus = (state, description) =>
+              github.rest.repos.createCommitStatus({
+                owner, repo, sha, state, context: 'PR safety check',
+                description: description.slice(0, 140), target_url: runUrl,
+              });
+
+            // Pending first, so a crash or cancellation still blocks the merge.
+            await setStatus('pending', 'Checking the PR for risky changes');
+
+            const findings = [];
+            const flag = (where, why) => {
+              if (!findings.some((f) => f.where === where && f.why === why)) findings.push({ where, why });
+            };
+
+            const RISKY_PATHS = [
+              [/^\.github\/(workflows|actions)\//, 'changes CI workflows or actions'],
+              [/^\.github\/(CODEOWNERS|dependabot\.ya?ml)$/, 'changes review or dependency automation'],
+              [/(^|\/)CODEOWNERS$/, 'changes who must review'],
+              [/(^|\/)(package\.json|package-lock\.json|npm-shrinkwrap\.json|\.npmrc|\.nvmrc)$/, 'changes dependencies or package manager config'],
+              [/(^|\/)(Cargo\.toml|Cargo\.lock|rust-toolchain(\.toml)?|build\.rs)$/, 'changes Rust dependencies, toolchain or build script'],
+              [/(^|\/)\.cargo\//, 'changes Cargo config, which can set custom runners'],
+              [/(^|\/)(Dockerfile|docker-compose[^/]*\.ya?ml|\.dockerignore)$/, 'changes container build'],
+              [/(^|\/)(render\.yaml|vercel\.json|Makefile)$/, 'changes deploy or build config'],
+              [/(^|\/)[^/]+\.config\.(js|cjs|mjs|ts|mts|cts)$/, 'changes a config file that runs during build, lint or test'],
+              [/(^|\/)eslint\.config\.[cm]?[jt]s$/, 'changes lint config, which runs code'],
+              [/(^|\/)prisma\/(schema\.prisma|migrations\/)/, 'changes the database schema or migrations'],
+              [/(^|\/)scripts\//, 'changes scripts that maintainers run'],
+              [/(^|\/)\.(husky|vscode|devcontainer|idea)\//, 'changes hooks or editor config that can run commands'],
+              [/(^|\/)\.git(ignore|attributes|modules)$/, 'changes git config that can hide files'],
+              [/(^|\/)(\.claude|\.cursor|\.windsurf)\//, 'changes AI coding tool settings'],
+              [/(^|\/)(AGENTS|CLAUDE|GEMINI)\.md$|(^|\/)\.cursorrules$|(^|\/)\.mcp\.json$/i, 'changes instructions or tools for AI agents'],
+              [/(^|\/)\.env(\..*)?$/, 'adds or changes an env file'],
+            ];
+            // Invisible and bidirectional characters can hide code from reviewers (Trojan Source).
+            const HIDDEN = /[​-\u200F\u202A-\u202E⁠-⁤\u2066-\u2069﻿]/;
+            const AGENT_TEXT = /\b(ignore (all )?(previous|prior) instructions|you are (an? )?(ai|assistant|reviewer)|as an ai|approve this (pr|pull request))\b/i;
+            const SECRET = /(-----BEGIN [A-Z ]*PRIVATE KEY-----|\bS[A-Z2-7]{55}\b|ghp_[A-Za-z0-9]{36}|AKIA[0-9A-Z]{16})/;
+            const BINARY = /\.(exe|dll|so|dylib|bin|wasm|jar|class|pyc|node)$/i;
+
+            // Files and patches
+            const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: pr.number, per_page: 100 });
+            if (files.length >= 3000) flag('(files)', 'too many files to inspect; review by hand');
+            for (const f of files) {
+              for (const name of [f.filename, f.previous_filename].filter(Boolean)) {
+                for (const [re, why] of RISKY_PATHS) if (re.test(name)) flag(name, why);
+                if (BINARY.test(name)) flag(name, 'adds or changes a binary file');
+                if (HIDDEN.test(name)) flag(name, 'file name contains invisible characters');
+              }
+              if (f.status === 'renamed' && f.previous_filename) flag(f.filename, `renamed from ${f.previous_filename}`);
+              const added = (f.patch || '').split('\n').filter((l) => l.startsWith('+')).join('\n');
+              if (HIDDEN.test(added)) flag(f.filename, 'adds invisible or bidirectional Unicode characters');
+              if (SECRET.test(added)) flag(f.filename, 'adds something that looks like a secret key');
+              if (AGENT_TEXT.test(added)) flag(f.filename, 'adds text addressed to an AI agent or reviewer');
+              if (!f.patch && f.status !== 'removed' && f.changes > 0) flag(f.filename, 'diff too large or binary; GitHub did not return a patch');
+            }
+
+            // Commits
+            const commits = await github.paginate(github.rest.pulls.listCommits, { owner, repo, pull_number: pr.number, per_page: 100 });
+            const author = pr.user.login.toLowerCase();
+            for (const c of commits) {
+              const short = c.sha.slice(0, 7);
+              const login = c.author?.login?.toLowerCase();
+              if (login && login !== author && c.author.type !== 'Bot') {
+                flag(`commit ${short}`, `authored by @${c.author.login}, not the PR author @${pr.user.login}`);
+              }
+              if (HIDDEN.test(c.commit.message)) flag(`commit ${short}`, 'message contains invisible characters');
+            }
+
+            // Text written by the contributor
+            for (const [where, text] of [['PR title', pr.title || ''], ['PR description', pr.body || '']]) {
+              if (HIDDEN.test(text)) flag(where, 'contains invisible or bidirectional Unicode characters');
+              if (AGENT_TEXT.test(text)) flag(where, 'contains text addressed to an AI agent or reviewer');
+            }
+            if (/<!--[\s\S]{200,}?-->/.test(pr.body || '')) flag('PR description', 'has a long hidden HTML comment');
+
+            // Report
+            const esc = (s) => String(s).replace(/[|`<>]/g, (ch) => ({ '|': '\\|', '`': "'", '<': '&lt;', '>': '&gt;' }[ch]));
+            if (findings.length === 0) {
+              await core.summary.addHeading('PR safety check: no risky changes found', 3)
+                .addRaw(`Checked ${files.length} file(s) and ${commits.length} commit(s). Still read the diff before merging.\n`)
+                .write();
+              await setStatus('success', 'No risky changes found');
+              return;
+            }
+            await core.summary.addHeading(`PR safety check: ${findings.length} risky change(s)`, 3)
+              .addRaw('Review these carefully before merging. If they are legitimate, a maintainer can merge anyway.\n\n')
+              .addRaw('| Where | Why |\n|---|---|\n' + findings.map((f) => `| ${esc(f.where)} | ${esc(f.why)} |`).join('\n') + '\n')
+              .write();
+            for (const f of findings) core.warning(`${f.where}: ${f.why}`);
+            await setStatus('failure', `${findings.length} risky change(s) found; review before merging`);
+            core.setFailed(`${findings.length} risky change(s) found. See the job summary.`);
